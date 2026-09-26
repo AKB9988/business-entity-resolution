@@ -228,6 +228,7 @@ class TextPreprocessor:
             "first_token": first_token,
             # Combined text representation for vector/TF-IDF indexing
             "full_representation": f"{cleaned_name} {cleaned_addr}".strip(),
+            "name_tokens": cleaned_name.split(),
         }
 
     def preprocess_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -239,6 +240,11 @@ class TextPreprocessor:
             self.preprocess_record(row) for row in df.to_dict(orient="records")
         ]
         return pd.DataFrame(processed_records)
+
+
+# Compatibility wrapper for modules that expect a standalone function
+def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    return TextPreprocessor().preprocess_dataframe(df)
 
 
 # Self-test demonstration when run as script
@@ -284,6 +290,8 @@ if __name__ == "__main__":
         print(f"Postal Code(s)  : {row['postal_codes']}")
         print(f"Address Numbers : {row['address_numbers']}")
         print(f"Blocking Keys   : Prefix='{row['name_prefix_3']}', FirstToken='{row['first_token']}'")
+
+  
 
     print("\n" + "=" * 70)
     print("All preprocessing checks PASSED successfully!")
