@@ -67,13 +67,14 @@ class TrainConfig:
     source3_file: str = "train_source3.tsv"
     ground_truth_file: str = "train_ground_truth.tsv"
 
-    models_dir: str = "models"
-    model_path: str = "models/model.pkl"
-    threshold_path: str = "models/threshold.json"
+    models_dir: str = "code/business_entity_resolution/models"
+    model_path: str = "code/business_entity_resolution/models/model.pkl"
+    threshold_path: str = "code/business_entity_resolution/models/threshold.json"
 
     n_splits: int = 5
     random_state: int = 42
     threshold_grid: tuple = field(default_factory=lambda: tuple(np.round(np.arange(0.05, 0.991, 0.01), 3)))
+    nrows: Optional[int] = None  # None = load full dataset, or specify integer for fast training subset
 
 
 # =============================================================================
@@ -230,9 +231,11 @@ def _labels_to_gt_map(features: pd.DataFrame, y: np.ndarray) -> dict[str, set]:
 def train(config: Optional[TrainConfig] = None) -> dict:
     config = config or TrainConfig()
 
-    s1_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source1_file), sep="\t", dtype=str)
-    s2_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source2_file), sep="\t", dtype=str)
-    s3_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source3_file), sep="\t", dtype=str)
+    s1_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source1_file), sep="\t", dtype=str, nrows=config.nrows)
+    s2_nrows = config.nrows * 3 if config.nrows else None
+    s3_nrows = config.nrows * 3 if config.nrows else None
+    s2_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source2_file), sep="\t", dtype=str, nrows=s2_nrows)
+    s3_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source3_file), sep="\t", dtype=str, nrows=s3_nrows)
     ground_truth_map = load_ground_truth_map(os.path.join(config.dataset_dir, config.ground_truth_file))
 
     features, all_s1_ids = build_labeled_dataset(s1_raw, s2_raw, s3_raw, ground_truth_map)

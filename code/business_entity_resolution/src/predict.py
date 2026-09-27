@@ -51,11 +51,13 @@ class PredictConfig:
     source2_file: str = "test_source2.tsv"
     source3_file: str = "test_source3.tsv"
 
-    model_path: str = "models/model.pkl"
-    threshold_path: str = "models/threshold.json"
+    model_path: str = "code/business_entity_resolution/models/model.pkl"
+    threshold_path: str = "code/business_entity_resolution/models/threshold.json"
 
     output_dir: str = "output"
     output_file: str = "matching_results.tsv"
+    candidate_file: str = "candidate_pairs.tsv"
+    nrows: Optional[int] = None
 
 
 def predict(config: Optional[PredictConfig] = None) -> pd.DataFrame:
@@ -67,15 +69,24 @@ def predict(config: Optional[PredictConfig] = None) -> pd.DataFrame:
     feature_cols = metadata["feature_columns"]
     model = load_model(config.model_path)
 
-    s1_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source1_file), sep="\t", dtype=str)
-    s2_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source2_file), sep="\t", dtype=str)
-    s3_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source3_file), sep="\t", dtype=str)
+    s1_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source1_file), sep="\t", dtype=str, nrows=config.nrows)
+    s2_nrows = config.nrows * 3 if config.nrows else None
+    s3_nrows = config.nrows * 3 if config.nrows else None
+    s2_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source2_file), sep="\t", dtype=str, nrows=s2_nrows)
+    s3_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source3_file), sep="\t", dtype=str, nrows=s3_nrows)
 
     s1 = preprocess_dataframe(s1_raw)
     s2 = preprocess_dataframe(s2_raw)
     s3 = preprocess_dataframe(s3_raw)
 
+    from blocking import write_candidate_pairs
     candidate_pairs = generate_candidates(s1, s2, s3, BlockingConfig())
+    
+    # Save candidate_pairs.tsv (Mandatory competition output)
+    os.makedirs(config.output_dir, exist_ok=True)
+    write_candidate_pairs(candidate_pairs, os.path.join(config.output_dir, config.candidate_file), s1_ids=s1["entity_id"])
+    print(f"[predict] wrote candidate pool -> {os.path.join(config.output_dir, config.candidate_file)}")
+
     candidate_df = pd.concat([s2, s3], ignore_index=True, sort=False)
     features = generate_pair_features(s1, candidate_df, candidate_pairs)
 
@@ -84,15 +95,11 @@ def predict(config: Optional[PredictConfig] = None) -> pd.DataFrame:
     predicted_matches: dict[str, list] = {eid: [] for eid in all_s1_ids}
 
     if not features.empty:
-        # IMPORTANT: use the exact feature column order saved by train.py --
-        # relying on dict/column order elsewhere would silently misalign
-        # features with what the model was actually trained on.
         missing = set(feature_cols) - set(features.columns)
         if missing:
             raise RuntimeError(
                 f"Test features are missing columns the model was trained on: {sorted(missing)}. "
-                "This means Person 3's feature_engineering.py output changed shape since training -- "
-                "retrain, or investigate the mismatch, before predicting."
+                "This means Person 3's feature_engineering.py output changed shape since training."
             )
         X_test = features[feature_cols].to_numpy(dtype=float)
         probs = model.predict_proba(X_test)[:, 1]
@@ -107,8 +114,8 @@ def predict(config: Optional[PredictConfig] = None) -> pd.DataFrame:
     n_one = sum(1 for v in predicted_matches.values() if len(v) == 1)
     n_multi = sum(1 for v in predicted_matches.values() if len(v) > 1)
     print(f"[predict] Source-1 entities: {len(all_s1_ids)}")
-    print(f"[predict] zero-match: {n_zero} | single-match: {n_one} | multi-match: {n_multi}")
-    print(f"[predict] wrote {os.path.join(config.output_dir, config.output_file)}")
+    print(f"[predict] zero-match (singletons): {n_zero} | single-match: {n_one} | multi-match: {n_multi}")
+    print(f"[predict] wrote matches -> {os.path.join(config.output_dir, config.output_file)}")
 
     return pd.DataFrame(
         [(eid, ",".join(v)) for eid, v in predicted_matches.items()],
