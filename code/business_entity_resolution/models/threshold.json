@@ -1,0 +1,79 @@
+{
+  "backend": "sklearn_hgb",
+  "feature_columns": [
+    "name_levenshtein",
+    "name_jaro_winkler",
+    "name_token_sort_ratio",
+    "name_token_set_ratio",
+    "name_jaccard",
+    "address_jaccard",
+    "name_phonetic_match",
+    "postal_exact_match",
+    "building_number_exact_match",
+    "name_length_ratio",
+    "address_length_ratio",
+    "name_token_count_diff",
+    "address_token_count_diff",
+    "name_character_length_diff",
+    "address_character_length_diff",
+    "source1_name_missing",
+    "candidate_name_missing",
+    "source1_address_missing",
+    "candidate_address_missing",
+    "source1_postal_missing",
+    "candidate_postal_missing"
+  ],
+  "threshold": 0.43,
+  "cv_macro_f05": 0.43650171667413046,
+  "cv_macro_precision": 0.4107142857142857,
+  "cv_macro_recall": 0.875,
+  "n_folds": 5,
+  "fold_reports": [
+    {
+      "fold": 0,
+      "n_train": 38,
+      "n_val": 12,
+      "pairwise_precision@0.5": 0.16666666666666666,
+      "pairwise_recall@0.5": 1.0,
+      "pairwise_f05@0.5": 0.19999999999999996,
+      "entity_macro_f05@0.5": 0.18181818181818182
+    },
+    {
+      "fold": 1,
+      "n_train": 38,
+      "n_val": 12,
+      "pairwise_precision@0.5": 0.16666666666666666,
+      "pairwise_recall@0.5": 1.0,
+      "pairwise_f05@0.5": 0.19999999999999996,
+      "entity_macro_f05@0.5": 0.3013136288998358
+    },
+    {
+      "fold": 2,
+      "n_train": 38,
+      "n_val": 12,
+      "pairwise_precision@0.5": 0.25,
+      "pairwise_recall@0.5": 1.0,
+      "pairwise_f05@0.5": 0.29411764705882354,
+      "entity_macro_f05@0.5": 0.3283699059561128
+    },
+    {
+      "fold": 3,
+      "n_train": 43,
+      "n_val": 7,
+      "pairwise_precision@0.5": 0.0,
+      "pairwise_recall@0.5": 0.0,
+      "pairwise_f05@0.5": 0.0,
+      "entity_macro_f05@0.5": 0.25
+    },
+    {
+      "fold": 4,
+      "n_train": 43,
+      "n_val": 7,
+      "pairwise_precision@0.5": 1.0,
+      "pairwise_recall@0.5": 1.0,
+      "pairwise_f05@0.5": 1.0,
+      "entity_macro_f05@0.5": 0.375
+    }
+  ],
+  "random_state": 42
+}
