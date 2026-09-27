@@ -60,7 +60,7 @@ class PredictConfig:
     nrows: Optional[int] = None
 
 
-def predict(config: Optional[PredictConfig] = None) -> pd.DataFrame:
+def predict(config: Optional[PredictConfig] = None) -> None:
     config = config or PredictConfig()
 
     with open(config.threshold_path) as f:
@@ -69,58 +69,111 @@ def predict(config: Optional[PredictConfig] = None) -> pd.DataFrame:
     feature_cols = metadata["feature_columns"]
     model = load_model(config.model_path)
 
-    s1_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source1_file), sep="\t", dtype=str, nrows=config.nrows)
-    s2_nrows = config.nrows * 3 if config.nrows else None
-    s3_nrows = config.nrows * 3 if config.nrows else None
-    s2_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source2_file), sep="\t", dtype=str, nrows=s2_nrows)
-    s3_raw = pd.read_csv(os.path.join(config.dataset_dir, config.source3_file), sep="\t", dtype=str, nrows=s3_nrows)
+    print("[predict] Loading pre-trained model and threshold...")
+    print(f"[predict] Optimal decision threshold: {threshold}")
 
-    s1 = preprocess_dataframe(s1_raw)
+    s1_path = os.path.join(config.dataset_dir, config.source1_file)
+    s2_path = os.path.join(config.dataset_dir, config.source2_file)
+    s3_path = os.path.join(config.dataset_dir, config.source3_file)
+
+    out_match_path = os.path.join(config.output_dir, config.output_file)
+    out_cand_path = os.path.join(config.output_dir, config.candidate_file)
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    # Pre-clean targets (S2 and S3) and build precomputed index once
+    print("[predict] Loading and preprocessing candidate sources (S2 & S3)...")
+    s2_raw = pd.read_csv(s2_path, sep="\t", dtype=str)
+    s3_raw = pd.read_csv(s3_path, sep="\t", dtype=str)
     s2 = preprocess_dataframe(s2_raw)
     s3 = preprocess_dataframe(s3_raw)
-
-    from blocking import write_candidate_pairs
-    candidate_pairs = generate_candidates(s1, s2, s3, BlockingConfig())
-    
-    # Save candidate_pairs.tsv (Mandatory competition output)
-    os.makedirs(config.output_dir, exist_ok=True)
-    write_candidate_pairs(candidate_pairs, os.path.join(config.output_dir, config.candidate_file), s1_ids=s1["entity_id"])
-    print(f"[predict] wrote candidate pool -> {os.path.join(config.output_dir, config.candidate_file)}")
-
     candidate_df = pd.concat([s2, s3], ignore_index=True, sort=False)
-    features = generate_pair_features(s1, candidate_df, candidate_pairs)
+    del s2_raw, s3_raw
+    print(f"[predict] Loaded {len(candidate_df)} total target records across S2 & S3.")
 
-    all_s1_ids = s1["entity_id"].tolist()
+    print("[predict] Building precomputed search index over target sources...")
+    from blocking import TargetIndex, BlockingConfig
+    blk_cfg = BlockingConfig()
+    s2_index = TargetIndex(s2, blk_cfg)
+    s3_index = TargetIndex(s3, blk_cfg)
+    print("[predict] Target search index built successfully!")
 
-    predicted_matches: dict[str, list] = {eid: [] for eid in all_s1_ids}
+    # Initialize output files with headers
+    with open(out_match_path, "w", encoding="utf-8") as fm:
+        fm.write("source1_entity_id\tmatched_entity_ids\n")
+    with open(out_cand_path, "w", encoding="utf-8") as fc:
+        fc.write("source1_entity_id\tcandidate_entity_ids\n")
 
-    if not features.empty:
-        missing = set(feature_cols) - set(features.columns)
-        if missing:
-            raise RuntimeError(
-                f"Test features are missing columns the model was trained on: {sorted(missing)}. "
-                "This means Person 3's feature_engineering.py output changed shape since training."
-            )
-        X_test = features[feature_cols].to_numpy(dtype=float)
-        probs = model.predict_proba(X_test)[:, 1]
+    chunk_size = 50000 if config.nrows is None else config.nrows
+    print(f"[predict] Streaming Source 1 in memory-safe chunks of {chunk_size}...")
 
-        for s1_id, cand_id, p in zip(features["source1_entity_id"], features["candidate_entity_id"], probs):
-            if p >= threshold:
-                predicted_matches[s1_id].append(cand_id)
+    total_processed = 0
+    zero_matches = 0
+    single_matches = 0
+    multi_matches = 0
 
-    write_matching_results(predicted_matches, os.path.join(config.output_dir, config.output_file), all_s1_ids)
+    s1_reader = pd.read_csv(s1_path, sep="\t", dtype=str, chunksize=chunk_size)
 
-    n_zero = sum(1 for v in predicted_matches.values() if len(v) == 0)
-    n_one = sum(1 for v in predicted_matches.values() if len(v) == 1)
-    n_multi = sum(1 for v in predicted_matches.values() if len(v) > 1)
-    print(f"[predict] Source-1 entities: {len(all_s1_ids)}")
-    print(f"[predict] zero-match (singletons): {n_zero} | single-match: {n_one} | multi-match: {n_multi}")
-    print(f"[predict] wrote matches -> {os.path.join(config.output_dir, config.output_file)}")
+    for chunk_idx, s1_chunk_raw in enumerate(s1_reader, start=1):
+        s1_clean = preprocess_dataframe(s1_chunk_raw)
+        
+        # Fast query against precomputed target indexes
+        s2_scored = s2_index.query(s1_clean)
+        s3_scored = s3_index.query(s1_clean)
+        
+        cand_pairs: dict[str, list[str]] = {}
+        for eid in s1_clean["entity_id"]:
+            combined = (s2_scored.get(eid, []) + s3_scored.get(eid, []))
+            combined.sort(key=lambda x: -x[1])
+            seen = set()
+            pruned: list[str] = []
+            for cand_id, _score in combined:
+                if cand_id in seen:
+                    continue
+                seen.add(cand_id)
+                pruned.append(cand_id)
+                if len(pruned) >= blk_cfg.max_candidates:
+                    break
+            cand_pairs[eid] = pruned
 
-    return pd.DataFrame(
-        [(eid, ",".join(v)) for eid, v in predicted_matches.items()],
-        columns=["source1_entity_id", "matched_entity_ids"],
-    )
+        # Compute features
+        features = generate_pair_features(s1_clean, candidate_df, cand_pairs)
+
+        predicted_matches: dict[str, list] = {eid: [] for eid in s1_clean["entity_id"]}
+
+        if not features.empty:
+            X_test = features[feature_cols].to_numpy(dtype=float)
+            probs = model.predict_proba(X_test)[:, 1]
+
+            for s1_id, cand_id, p in zip(features["source1_entity_id"], features["candidate_entity_id"], probs):
+                if p >= threshold:
+                    predicted_matches[s1_id].append(cand_id)
+
+        # Append to candidate_pairs.tsv and matching_results.tsv
+        with open(out_cand_path, "a", encoding="utf-8") as fc:
+            for eid in s1_clean["entity_id"]:
+                cands = cand_pairs.get(eid, [])
+                fc.write(f"{eid}\t{','.join(cands)}\n")
+
+        with open(out_match_path, "a", encoding="utf-8") as fm:
+            for eid in s1_clean["entity_id"]:
+                matches = predicted_matches.get(eid, [])
+                fm.write(f"{eid}\t{','.join(matches)}\n")
+                if len(matches) == 0:
+                    zero_matches += 1
+                elif len(matches) == 1:
+                    single_matches += 1
+                else:
+                    multi_matches += 1
+
+        total_processed += len(s1_clean)
+        print(f"[predict] Chunk {chunk_idx}: Processed {total_processed:,} Source 1 entities... "
+              f"(Singletons: {zero_matches:,}, Matches: {single_matches + multi_matches:,})")
+
+        if config.nrows and total_processed >= config.nrows:
+            break
+
+    print(f"\n[predict] COMPLETE! Total entities: {total_processed:,}")
+    print(f"[predict] Output written to {out_match_path} and {out_cand_path}")
 
 
 def write_matching_results(predicted_matches: dict[str, list], output_path: str, s1_ids: list) -> None:

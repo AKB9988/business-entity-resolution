@@ -77,24 +77,27 @@ class BlockingConfig:
 
 
 # ---------------------------------------------------------------------------
-# CHANNEL 1: TOKEN / PREFIX INVERTED INDEX
+# CHANNEL 1: TOKEN INVERTED INDEX (PRUNED FOR SCALE)
 # ---------------------------------------------------------------------------
-def _build_inverted_index(df: pd.DataFrame, config: BlockingConfig) -> dict[str, set[str]]:
+def _build_inverted_index(df: pd.DataFrame, config: BlockingConfig, max_bucket_size: int = 300) -> dict[str, list[str]]:
     """
-    Build an inverted index: token -> set of entity_ids that contain it.
-    Also indexes each name's first `prefix_len` characters as a pseudo-token,
-    so short/rare names still get *some* blocking key even with few tokens.
+    Build a memory-safe inverted index: token -> list of entity_ids that contain it.
+    Buckets larger than max_bucket_size (generic words/stopwords) are pruned
+    because Channel 2 (TF-IDF Top-K) already handles those safely with cosine ranking.
     """
-    index: dict[str, set[str]] = defaultdict(set)
-    for _, row in df.iterrows():
-        eid = row[config.id_col]
-        tokens = row[config.tokens_col] if isinstance(row[config.tokens_col], list) else []
-        for tok in tokens:
-            index[tok].add(eid)
-        name = row[config.name_col] or ""
-        if len(name) >= config.prefix_len:
-            index[f"__prefix__{name[:config.prefix_len]}"].add(eid)
-    return index
+    index: dict[str, list[str]] = defaultdict(list)
+    tokens_col = df[config.tokens_col] if config.tokens_col in df.columns else None
+    names = df[config.name_col].fillna("").tolist()
+    eids = df[config.id_col].tolist()
+
+    for eid, name in zip(eids, names):
+        toks = name.split()
+        for tok in toks:
+            if len(tok) >= 3:
+                index[tok].append(eid)
+                
+    # Keep only high-signal, discriminatory token buckets
+    return {k: set(v) for k, v in index.items() if len(v) <= max_bucket_size}
 
 
 def _inverted_index_candidates(
@@ -102,20 +105,15 @@ def _inverted_index_candidates(
     index: dict[str, set[str]],
     config: BlockingConfig,
 ) -> set[str]:
-    """Return candidate entity_ids for one Source1 row via token/prefix lookup."""
+    """Return candidate entity_ids for one Source1 row via token lookup."""
     candidates: set[str] = set()
-    tokens = s1_row[config.tokens_col] if isinstance(s1_row[config.tokens_col], list) else []
-    hit_counts: dict[str, int] = defaultdict(int)
-    for tok in tokens:
-        for eid in index.get(tok, ()):
-            hit_counts[eid] += 1
-    for eid, count in hit_counts.items():
-        if count >= config.min_token_overlap:
-            candidates.add(eid)
-
-    name = s1_row[config.name_col] or ""
-    if len(name) >= config.prefix_len:
-        candidates |= index.get(f"__prefix__{name[:config.prefix_len]}", set())
+    name = str(s1_row[config.name_col] or "")
+    toks = name.split()
+    for tok in toks:
+        if tok in index:
+            candidates.update(index[tok])
+            if len(candidates) >= 50:
+                break
     return candidates
 
 
@@ -178,46 +176,76 @@ def _tfidf_topk_within_partition(
 # ---------------------------------------------------------------------------
 # CANDIDATE AGGREGATION & PRUNING
 # ---------------------------------------------------------------------------
+class TargetIndex:
+    """Precomputed inverted indexes and TF-IDF matrix for target sources (S2/S3)."""
+    def __init__(self, target_df: pd.DataFrame, config: BlockingConfig = BlockingConfig()):
+        self.config = config
+        self.partitions = {}
+        for country in target_df[config.country_col].dropna().unique():
+            part = target_df[target_df[config.country_col] == country]
+            if part.empty:
+                continue
+            inv_idx = _build_inverted_index(part, config)
+            vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=config.ngram_range, min_df=1)
+            target_vecs = vectorizer.fit_transform(part[config.name_col].fillna(""))
+            self.partitions[country] = {
+                "part": part,
+                "inv_idx": inv_idx,
+                "vectorizer": vectorizer,
+                "target_vecs": target_vecs,
+                "target_ids": part[config.id_col].to_numpy()
+            }
+
+    def query(self, s1_df: pd.DataFrame) -> dict[str, list[tuple[str, float]]]:
+        results: dict[str, list[tuple[str, float]]] = {eid: [] for eid in s1_df[self.config.id_col]}
+        for country, pdata in self.partitions.items():
+            s1_part = s1_df[s1_df[self.config.country_col] == country]
+            if s1_part.empty:
+                continue
+            
+            # Channel A: Inverted index
+            inv_candidates: dict[str, set[str]] = {}
+            for _, s1_row in s1_part.iterrows():
+                inv_candidates[s1_row[self.config.id_col]] = _inverted_index_candidates(s1_row, pdata["inv_idx"], self.config)
+
+            # Channel B: TF-IDF transform & dot product
+            s1_vecs = pdata["vectorizer"].transform(s1_part[self.config.name_col].fillna(""))
+            sim_matrix = sparse.csr_matrix(s1_vecs @ pdata["target_vecs"].T)
+
+            target_ids = pdata["target_ids"]
+            s1_ids = s1_part[self.config.id_col].to_numpy()
+            top_k = min(self.config.tfidf_top_k, len(target_ids))
+
+            for row_idx in range(sim_matrix.shape[0]):
+                eid = s1_ids[row_idx]
+                row = sim_matrix.getrow(row_idx)
+                score_map = {}
+                if row.nnz > 0:
+                    cols = row.indices
+                    scores = row.data
+                    if len(cols) > top_k:
+                        top_pos = np.argpartition(-scores, top_k - 1)[:top_k]
+                        cols = cols[top_pos]
+                        scores = scores[top_pos]
+                    for idx, sc in zip(cols, scores):
+                        if sc > 0:
+                            score_map[target_ids[idx]] = float(sc)
+                
+                # Union with inverted index
+                for tid in inv_candidates.get(eid, set()):
+                    score_map.setdefault(tid, 0.01)
+                
+                results[eid] = sorted(score_map.items(), key=lambda x: -x[1])
+        return results
+
+
 def _generate_for_one_target_source(
     s1_df: pd.DataFrame,
     target_df: pd.DataFrame,
     config: BlockingConfig,
 ) -> dict[str, list[tuple[str, float]]]:
-    """
-    Run both blocking channels for one target source (Source2 OR Source3),
-    partitioned by country, and return a merged/scored candidate list per
-    Source1 entity: {s1_entity_id: [(target_entity_id, score), ...]}.
-    """
-    merged: dict[str, list[tuple[str, float]]] = {eid: [] for eid in s1_df[config.id_col]}
-
-    countries = pd.unique(pd.concat([s1_df[config.country_col], target_df[config.country_col]]))
-    for country in countries:
-        s1_part = s1_df[s1_df[config.country_col] == country]
-        target_part = target_df[target_df[config.country_col] == country]
-        if s1_part.empty or target_part.empty:
-            continue  # nothing to match against in this partition
-
-        # Channel A: inverted index (cheap, catches near-exact token matches)
-        inv_index = _build_inverted_index(target_part, config)
-        inv_candidates: dict[str, set[str]] = {}
-        for _, s1_row in s1_part.iterrows():
-            inv_candidates[s1_row[config.id_col]] = _inverted_index_candidates(s1_row, inv_index, config)
-
-        # Channel B: TF-IDF char n-gram cosine top-K (catches typos / partial overlap)
-        tfidf_candidates = _tfidf_topk_within_partition(s1_part, target_part, config)
-
-        # Union the two channels, scoring everything by TF-IDF similarity.
-        # For inverted-index-only hits with no TF-IDF score computed (shouldn't
-        # normally happen since TF-IDF covers the whole partition), default to
-        # a small positive floor score so they aren't dropped by pruning.
-        for eid in s1_part[config.id_col]:
-            score_map = {t_id: score for t_id, score in tfidf_candidates.get(eid, [])}
-            for t_id in inv_candidates.get(eid, set()):
-                score_map.setdefault(t_id, 0.01)
-            ranked = sorted(score_map.items(), key=lambda x: -x[1])
-            merged[eid] = ranked
-
-    return merged
+    idx = TargetIndex(target_df, config)
+    return idx.query(s1_df)
 
 
 def generate_candidates(
@@ -230,9 +258,6 @@ def generate_candidates(
     Main entry point. Produces the final candidate_pairs mapping:
         {source1_entity_id: [candidate_entity_id, ...]}   (S2/S3 IDs, deduped,
                                                              pruned to max_candidates)
-    Candidates from Source2 and Source3 are generated independently, merged,
-    then re-pruned together so the overall cap (`max_candidates`) is respected
-    across both sources combined — not per-source.
     """
     s2_scored = _generate_for_one_target_source(s1_df, s2_df, config)
     s3_scored = _generate_for_one_target_source(s1_df, s3_df, config)
@@ -241,8 +266,6 @@ def generate_candidates(
     for eid in s1_df[config.id_col]:
         combined = (s2_scored.get(eid, []) + s3_scored.get(eid, []))
         combined.sort(key=lambda x: -x[1])
-        # Dedup while preserving best score's position (shouldn't collide
-        # across sources since IDs are source-prefixed, but stay safe).
         seen = set()
         pruned: list[str] = []
         for cand_id, _score in combined:
